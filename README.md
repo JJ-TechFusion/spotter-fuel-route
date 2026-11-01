@@ -118,7 +118,7 @@ Or import `postman/spotter-fuel-route.postman_collection.json` and `postman/loca
 python manage.py test
 ```
 
-18 tests. They don't call OSRM (it's mocked) and use their own temporary database, so they work offline and don't touch your loaded data.
+19 tests. They don't call OSRM (it's mocked) and use their own temporary database, so they work offline and don't touch your loaded data.
 
 ### Configuration
 

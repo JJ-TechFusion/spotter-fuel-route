@@ -70,6 +70,14 @@ class TripApiTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("Unknown US city", response.json()["detail"])
 
+    def test_map_errors_are_plain_text(self):
+        response = self.get(start="Atlantis, KS", path="/api/trips/map/")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.content.decode(), "Unknown US city: 'Atlantis, KS'.")
+
+        response = self.client.get("/api/trips/map/", {"start": "Start, KS"})
+        self.assertEqual(response.content.decode(), "finish: This field is required.")
+
     def test_location_outside_usa_is_a_bad_request(self):
         self.assertEqual(self.get(start="51.5,-0.12").status_code, 400)
 

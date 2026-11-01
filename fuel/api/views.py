@@ -47,10 +47,21 @@ class TripPlanView(APIView):
         return Response(data)
 
 
+def error_text(detail) -> str:
+    """Flatten DRF error detail ({"detail": ...}, {"field": [...]}, or a string) to plain text."""
+    if isinstance(detail, dict):
+        return "\n".join(
+            error_text(value) if key == "detail" else f"{key}: {error_text(value)}" for key, value in detail.items()
+        )
+    if isinstance(detail, list):
+        return " ".join(error_text(item) for item in detail)
+    return str(detail)
+
+
 def trip_map_view(request):
     """GET /api/trips/map/?start=...&finish=... renders the same plan on a Leaflet map."""
     try:
         plan = get_trip_plan(request.GET)
     except APIException as exc:
-        return HttpResponse(str(exc.detail), status=exc.status_code, content_type="text/plain")
+        return HttpResponse(error_text(exc.detail), status=exc.status_code, content_type="text/plain")
     return render(request, "fuel/map.html", {"trip": TripPlanSerializer(plan).data})

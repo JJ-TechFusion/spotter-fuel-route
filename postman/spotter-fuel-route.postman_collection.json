@@ -1515,7 +1515,7 @@
                   "value": "text/plain"
                 }
               ],
-              "body": "{'detail': ErrorDetail(string=\"Unknown US city: 'Atlantis, KS'.\", code='invalid')}"
+              "body": "Unknown US city: 'Atlantis, KS'."
             }
           ]
         },
