@@ -1,0 +1,1609 @@
+{
+  "info": {
+    "name": "Spotter Fuel Route API",
+    "description": "Fuel route planner API: give it a start and finish in the USA and it returns the driving\nroute, the cheapest places to refuel along it, and the total fuel cost.\n\n- Vehicle: **500-mile range, 10 mpg**, tank starts empty\n- Fuel prices: the supplied `fuel_prices.csv`\n- Routing: OSRM public server, **one call per trip**, cached after that\n- Geocoding: offline (US Census gazetteer), no API calls\n\n## Setup\n\n1. Start the server: `python manage.py runserver` (after `migrate` and `load_data`, see README).\n2. Import this collection and the `Spotter Fuel Route - Local` environment, and select the environment.\n   Without it the collection falls back to its own `baseUrl` of `http://127.0.0.1:8000`.\n3. Run the folders in order with the Collection Runner, or send requests one at a time.\n\nFrom the command line: `npx newman run postman/spotter-fuel-route.postman_collection.json -e postman/local.postman_environment.json`\n\n## Endpoints\n\n### `GET /api/trips/?start=<location>&finish=<location>`\n\nA location is `City, ST` (`Chicago, IL`) or `lat,lon` (`41.88,-87.63`).\n\n| Field | Meaning |\n| --- | --- |\n| `start`, `finish` | Resolved coordinates |\n| `distance_miles`, `duration_hours` | From OSRM |\n| `total_gallons` | `distance_miles / 10` |\n| `total_cost` | Sum of all stop costs, USD |\n| `fuel_stops[]` | In route order: `station` (name, address, price, location), `mile` marker, `gallons` bought, `cost` |\n| `route` | GeoJSON LineString, `[lon, lat]` pairs, a point every half mile |\n| `map_url` | The same trip drawn on a map |\n\n### `GET /api/trips/map/?start=...&finish=...`\n\nHTML page with a Leaflet map of the route and numbered stops. Uses the cached plan.\n\n## Tests\n\nEvery request has tests. A collection-level script also checks every successful plan\nagainst the business rules (see the *1. Plan a trip* folder), so the numbers are verified,\nnot only the status codes.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Shared checks. Run after every request in the collection.",
+          "// Any successful trip plan (JSON with fuel_stops) gets the full invariant suite,",
+          "// so each happy-path request only needs to add what is specific to it.",
+          "const MPG = Number(pm.collectionVariables.get(\"mpg\"));",
+          "const RANGE = Number(pm.collectionVariables.get(\"rangeMiles\"));",
+          "const near = (a, b, tol) => Math.abs(a - b) <= tol;",
+          "",
+          "const isJson = (pm.response.headers.get(\"Content-Type\") || \"\").includes(\"application/json\");",
+          "const body = isJson ? pm.response.json() : null;",
+          "",
+          "if (pm.response.code === 200 && body && Array.isArray(body.fuel_stops)) {",
+          "    const stops = body.fuel_stops;",
+          "",
+          "    pm.test(\"[plan] has every top-level field\", () => {",
+          "        pm.expect(body).to.include.all.keys(",
+          "            \"start\", \"finish\", \"distance_miles\", \"duration_hours\",",
+          "            \"total_gallons\", \"total_cost\", \"fuel_stops\", \"route\", \"map_url\");",
+          "    });",
+          "",
+          "    pm.test(\"[plan] every stop has station, mile, gallons, cost\", () => {",
+          "        stops.forEach(s => {",
+          "            pm.expect(s).to.include.all.keys(\"station\", \"mile\", \"gallons\", \"cost\");",
+          "            pm.expect(s.station).to.include.all.keys(\"id\", \"name\", \"address\", \"city\", \"state\", \"price\", \"location\");",
+          "            pm.expect(s.station.price).to.be.above(0);",
+          "        });",
+          "    });",
+          "",
+          "    pm.test(`[plan] total_gallons = distance / ${MPG} mpg`, () => {",
+          "        pm.expect(near(body.total_gallons, body.distance_miles / MPG, 0.05)).to.be.true;",
+          "    });",
+          "",
+          "    pm.test(\"[plan] total_cost = sum of stop costs\", () => {",
+          "        const sum = stops.reduce((t, s) => t + s.cost, 0);",
+          "        pm.expect(near(body.total_cost, sum, 0.01 * stops.length + 0.01)).to.be.true;",
+          "    });",
+          "",
+          "    pm.test(\"[plan] each stop's cost = gallons x price\", () => {",
+          "        stops.forEach(s => pm.expect(near(s.cost, s.gallons * s.station.price, 0.03),",
+          "            `${s.station.name}: ${s.gallons} gal x $${s.station.price} != $${s.cost}`).to.be.true);",
+          "    });",
+          "",
+          "    pm.test(\"[plan] stops are in route order\", () => {",
+          "        stops.forEach((s, i) => { if (i) pm.expect(s.mile).to.be.at.least(stops[i - 1].mile); });",
+          "    });",
+          "",
+          "    pm.test(`[plan] no leg is longer than the ${RANGE}-mile range`, () => {",
+          "        const marks = stops.map(s => s.mile).concat([body.distance_miles]);",
+          "        for (let i = 1; i < marks.length; i++) {",
+          "            pm.expect(marks[i] - marks[i - 1], `leg ending at mile ${marks[i]}`).to.be.at.most(RANGE + 0.1);",
+          "        }",
+          "    });",
+          "",
+          "    pm.test(\"[plan] each stop buys exactly the fuel to reach the next stop\", () => {",
+          "        stops.forEach((s, i) => {",
+          "            const next = i + 1 < stops.length ? stops[i + 1].mile : body.distance_miles;",
+          "            const miles = (next - s.mile) + (i === 0 ? s.mile : 0); // tank starts empty",
+          "            pm.expect(near(s.gallons * MPG, miles, 0.2), `stop ${i + 1} at mile ${s.mile}`).to.be.true;",
+          "        });",
+          "    });",
+          "",
+          "    pm.test(\"[plan] route is a GeoJSON LineString starting near the start point\", () => {",
+          "        pm.expect(body.route.type).to.eql(\"LineString\");",
+          "        pm.expect(body.route.coordinates.length).to.be.at.least(2);",
+          "        const [lon, lat] = body.route.coordinates[0];",
+          "        pm.expect(near(lat, body.start.lat, 0.2) && near(lon, body.start.lon, 0.2)).to.be.true;",
+          "    });",
+          "",
+          "    pm.test(\"[plan] map_url points at the map view\", () => {",
+          "        pm.expect(body.map_url).to.include(\"/api/trips/map/?\");",
+          "    });",
+          "",
+          "    // Handy for the \"Map\" folder and for eyeballing results in the console.",
+          "    pm.collectionVariables.set(\"lastMapUrl\", body.map_url);",
+          "    console.log(`${body.distance_miles} mi, ${stops.length} stops, $${body.total_cost} ` +",
+          "        `in ${pm.response.responseTime} ms`);",
+          "}",
+          "",
+          "if (pm.response.code === 400 && body) {",
+          "    pm.test(\"[error] 400 body explains what is wrong\", () => {",
+          "        pm.expect(Object.keys(body).length).to.be.above(0);",
+          "    });",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000"
+    },
+    {
+      "key": "mpg",
+      "value": "10"
+    },
+    {
+      "key": "rangeMiles",
+      "value": "500"
+    },
+    {
+      "key": "lastMapUrl",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Plan a trip",
+      "description": "\nHappy-path trips. Every request here also runs the collection-level invariant tests\n(`[plan] ...`): totals add up, each stop costs gallons x price, no leg exceeds 500 miles,\neach stop buys exactly the fuel for the next leg, and `route` is valid GeoJSON.\n\nRun **Chicago -> Denver (cold)** before **(cached)**: the second one should come back in\nmilliseconds because the plan is cached and OSRM is not called again.\n",
+      "item": [
+        {
+          "name": "Chicago, IL -> Denver, CO (cold)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"distance is roughly 1,000 miles\", () => {",
+                  "    const d = pm.response.json().distance_miles;",
+                  "    pm.expect(d).to.be.within(950, 1050);",
+                  "});",
+                  "pm.test(\"at least 3 stops (start + 2 refuels)\", () => {",
+                  "    pm.expect(pm.response.json().fuel_stops.length).to.be.at.least(3);",
+                  "});",
+                  "pm.collectionVariables.set(\"coldMs\", pm.response.responseTime);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=Chicago, IL&finish=Denver, CO",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Chicago, IL",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "Denver, CO",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "\nA ~1,000-mile trip: needs at least two fuel stops after the start.\n\nThe first request for a trip makes the one OSRM routing call (about 1-2 s). If you have\nalready run it since the server started, it will be served from cache.\n"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=Chicago, IL&finish=Denver, CO",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "Chicago, IL",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Denver, CO",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"start\": {\n    \"lat\": 41.83705,\n    \"lon\": -87.68494\n  },\n  \"finish\": {\n    \"lat\": 39.76185,\n    \"lon\": -104.88111\n  },\n  \"distance_miles\": 1002.7,\n  \"duration_hours\": 17.8,\n  \"total_gallons\": 100.27,\n  \"total_cost\": 292.94,\n  \"fuel_stops\": [\n    {\n      \"station\": {\n        \"id\": 73127,\n        \"name\": \"Gas N Wash\",\n        \"address\": \"I-55, EXIT 285\",\n        \"city\": \"Chicago\",\n        \"state\": \"IL\",\n        \"price\": 3.399,\n        \"location\": {\n          \"lat\": 41.83705,\n          \"lon\": -87.68494\n        }\n      },\n      \"mile\": 0.0,\n      \"gallons\": 1.42,\n      \"cost\": 4.84\n    },\n    {\n      \"station\": {\n        \"id\": 70180,\n        \"name\": \"Gulf\",\n        \"address\": \"SR-83\",\n        \"city\": \"Bensenville\",\n        \"state\": \"IL\",\n        \"price\": 3.059,\n        \"location\": {\n          \"lat\": 41.95801,\n          \"lon\": -87.94383\n        }\n      },\n      \"mile\": 14.2,\n      \"gallons\": 18.77,\n      \"cost\": 57.42\n    },\n    {\n      \"station\": {\n        \"id\": 67395,\n        \"name\": \"KUM & GO #0267\",\n        \"address\": \"I-80, EXIT 267 & SR 38\",\n        \"city\": \"Tipton\",\n        \"state\": \"IA\",\n        \"price\": 2.982,\n        \"location\": {\n          \"lat\": 41.77012,\n          \"lon\": -91.12828\n        }\n      },\n      \"mile\": 202.0,\n      \"gallons\": 35.73,\n      \"cost\": 106.56\n    },\n    {\n      \"station\": {\n        \"id\": 68368,\n        \"name\": \"AKAL TRAVEL CENTER\",\n        \"address\": \"I-80 EX 360\",\n        \"city\": \"Waco\",\n        \"state\": \"NE\",\n        \"price\": 2.799,\n        \"location\": {\n          \"lat\": 40.897,\n          \"lon\": -97.46175\n        }\n      },\n      \"mile\": 559.3,\n      \"gallons\": 44.34,\n      \"cost\": 124.12\n    }\n  ],\n  \"route\": {\n    \"type\": \"LineString\",\n    \"coordinates\": [\n      [\n        -87.68488,\n        41.83705\n      ],\n      [\n        -87.68535,\n        41.84442\n      ],\n      [\n        -87.68562,\n        41.85166\n      ],\n      [\n        -104.88949,\n        39.76936\n      ],\n      [\n        -104.88454,\n        39.76301\n      ],\n      [\n        -104.8807,\n        39.76256\n      ]\n    ],\n    \"_note\": \"Trimmed to 6 of 1547 points for this example.\"\n  },\n  \"map_url\": \"http://127.0.0.1:8000/api/trips/map/?start=Chicago%2C+IL&finish=Denver%2C+CO\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Chicago, IL -> Denver, CO (cached)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"cached repeat responds in under 300 ms\", () => {",
+                  "    pm.expect(pm.response.responseTime).to.be.below(300);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=Chicago, IL&finish=Denver, CO",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Chicago, IL",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "Denver, CO",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "\nSame trip again. Served from the cache: no routing call, typically ~10 ms.\n"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=Chicago, IL&finish=Denver, CO",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "Chicago, IL",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Denver, CO",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"start\": {\n    \"lat\": 41.83705,\n    \"lon\": -87.68494\n  },\n  \"finish\": {\n    \"lat\": 39.76185,\n    \"lon\": -104.88111\n  },\n  \"distance_miles\": 1002.7,\n  \"duration_hours\": 17.8,\n  \"total_gallons\": 100.27,\n  \"total_cost\": 292.94,\n  \"fuel_stops\": [\n    {\n      \"station\": {\n        \"id\": 73127,\n        \"name\": \"Gas N Wash\",\n        \"address\": \"I-55, EXIT 285\",\n        \"city\": \"Chicago\",\n        \"state\": \"IL\",\n        \"price\": 3.399,\n        \"location\": {\n          \"lat\": 41.83705,\n          \"lon\": -87.68494\n        }\n      },\n      \"mile\": 0.0,\n      \"gallons\": 1.42,\n      \"cost\": 4.84\n    },\n    {\n      \"station\": {\n        \"id\": 70180,\n        \"name\": \"Gulf\",\n        \"address\": \"SR-83\",\n        \"city\": \"Bensenville\",\n        \"state\": \"IL\",\n        \"price\": 3.059,\n        \"location\": {\n          \"lat\": 41.95801,\n          \"lon\": -87.94383\n        }\n      },\n      \"mile\": 14.2,\n      \"gallons\": 18.77,\n      \"cost\": 57.42\n    },\n    {\n      \"station\": {\n        \"id\": 67395,\n        \"name\": \"KUM & GO #0267\",\n        \"address\": \"I-80, EXIT 267 & SR 38\",\n        \"city\": \"Tipton\",\n        \"state\": \"IA\",\n        \"price\": 2.982,\n        \"location\": {\n          \"lat\": 41.77012,\n          \"lon\": -91.12828\n        }\n      },\n      \"mile\": 202.0,\n      \"gallons\": 35.73,\n      \"cost\": 106.56\n    },\n    {\n      \"station\": {\n        \"id\": 68368,\n        \"name\": \"AKAL TRAVEL CENTER\",\n        \"address\": \"I-80 EX 360\",\n        \"city\": \"Waco\",\n        \"state\": \"NE\",\n        \"price\": 2.799,\n        \"location\": {\n          \"lat\": 40.897,\n          \"lon\": -97.46175\n        }\n      },\n      \"mile\": 559.3,\n      \"gallons\": 44.34,\n      \"cost\": 124.12\n    }\n  ],\n  \"route\": {\n    \"type\": \"LineString\",\n    \"coordinates\": [\n      [\n        -87.68488,\n        41.83705\n      ],\n      [\n        -87.68535,\n        41.84442\n      ],\n      [\n        -87.68562,\n        41.85166\n      ],\n      [\n        -104.88949,\n        39.76936\n      ],\n      [\n        -104.88454,\n        39.76301\n      ],\n      [\n        -104.8807,\n        39.76256\n      ]\n    ],\n    \"_note\": \"Trimmed to 6 of 1547 points for this example.\"\n  },\n  \"map_url\": \"http://127.0.0.1:8000/api/trips/map/?start=Chicago%2C+IL&finish=Denver%2C+CO\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "New York, NY -> Los Angeles, CA (cross-country)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test(\"distance is roughly 2,800 miles\", () => pm.expect(body.distance_miles).to.be.within(2600, 3000));",
+                  "pm.test(\"needs at least 6 stops for 500-mile legs\", () => pm.expect(body.fuel_stops.length).to.be.at.least(6));",
+                  "pm.test(\"average price paid is below the priciest stop\", () => {",
+                  "    const avg = body.total_cost / body.total_gallons;",
+                  "    const max = Math.max(...body.fuel_stops.map(s => s.station.price));",
+                  "    pm.expect(avg).to.be.at.most(max);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=New York, NY&finish=Los Angeles, CA",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "New York, NY",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "Los Angeles, CA",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "\nThe headline case: ~2,800 miles, so several 500-mile legs. Shows the optimizer picking\ncheap states and skipping expensive ones (e.g. filling up before California).\n"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=New York, NY&finish=Los Angeles, CA",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "New York, NY",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Los Angeles, CA",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"start\": {\n    \"lat\": 40.66271,\n    \"lon\": -73.93868\n  },\n  \"finish\": {\n    \"lat\": 34.01939,\n    \"lon\": -118.41083\n  },\n  \"distance_miles\": 2810.4,\n  \"duration_hours\": 50.3,\n  \"total_gallons\": 281.04,\n  \"total_cost\": 864.91,\n  \"fuel_stops\": [\n    {\n      \"station\": {\n        \"id\": 62790,\n        \"name\": \"7-ELEVEN #40084\",\n        \"address\": \"US-46/US-1/US-9\",\n        \"city\": \"Palisades Park\",\n        \"state\": \"NJ\",\n        \"price\": 3.099,\n        \"location\": {\n          \"lat\": 40.84702,\n          \"lon\": -73.99706\n        }\n      },\n      \"mile\": 9.0,\n      \"gallons\": 39.39,\n      \"cost\": 122.06\n    },\n    {\n      \"station\": {\n        \"id\": 72445,\n        \"name\": \"SHEETZ #639\",\n        \"address\": \"I-80 Exit 223\",\n        \"city\": \"Youngstown\",\n        \"state\": \"OH\",\n        \"price\": 3.059,\n        \"location\": {\n          \"lat\": 41.09909,\n          \"lon\": -80.6459\n        }\n      },\n      \"mile\": 393.9,\n      \"gallons\": 46.21,\n      \"cost\": 141.34\n    },\n    {\n      \"station\": {\n        \"id\": 70744,\n        \"name\": \"CASEYS #3686\",\n        \"address\": \"I-80 EXIT 81\",\n        \"city\": \"Utica\",\n        \"state\": \"IL\",\n        \"price\": 2.969,\n        \"location\": {\n          \"lat\": 41.3456,\n          \"lon\": -88.98634\n        }\n      },\n      \"mile\": 855.9,\n      \"gallons\": 48.51,\n      \"cost\": 144.03\n    },\n    {\n      \"station\": {\n        \"id\": 68368,\n        \"name\": \"AKAL TRAVEL CENTER\",\n        \"address\": \"I-80 EX 360\",\n        \"city\": \"Waco\",\n        \"state\": \"NE\",\n        \"price\": 2.799,\n        \"location\": {\n          \"lat\": 40.897,\n          \"lon\": -97.46175\n        }\n      },\n      \"mile\": 1341.0,\n      \"gallons\": 40.97,\n      \"cost\": 114.68\n    },\n    {\n      \"station\": {\n        \"id\": 73101,\n        \"name\": \"7-ELEVEN 42279\",\n        \"address\": \"I-76, Exit 39\",\n        \"city\": \"Keenesburg\",\n        \"state\": \"CO\",\n        \"price\": 3.149,\n        \"location\": {\n          \"lat\": 40.15517,\n          \"lon\": -104.56342\n        }\n      },\n      \"mile\": 1750.8,\n      \"gallons\": 37.47,\n      \"cost\": 117.99\n    },\n    {\n      \"station\": {\n        \"id\": 71712,\n        \"name\": \"MAVERIK COUNTRY STORE #693\",\n        \"address\": \"I-70, Exit 160 & hwy 191\",\n        \"city\": \"Green River\",\n        \"state\": \"UT\",\n        \"price\": 3.282,\n        \"location\": {\n          \"lat\": 38.99346,\n          \"lon\": -110.17342\n        }\n      },\n      \"mile\": 2125.5,\n      \"gallons\": 39.56,\n      \"cost\": 129.85\n    },\n    {\n      \"station\": {\n        \"id\": 72965,\n        \"name\": \"Maverik #674\",\n        \"address\": \"I-15, Exit 45\",\n        \"city\": \"North Las Vegas\",\n        \"state\": \"NV\",\n        \"price\": 3.282,\n        \"location\": {\n          \"lat\": 36.28986,\n          \"lon\": -115.08918\n        }\n      },\n      \"mile\": 2521.0,\n      \"gallons\": 28.93,\n      \"cost\": 94.96\n    }\n  ],\n  \"route\": {\n    \"type\": \"LineString\",\n    \"coordinates\": [\n      [\n        -73.93872,\n        40.6631\n      ],\n      [\n        -73.94829,\n        40.66407\n      ],\n      [\n        -73.95784,\n        40.66348\n      ],\n      [\n        -118.40745,\n        34.02699\n      ],\n      [\n        -118.41081,\n        34.02022\n      ],\n      [\n        -118.41035,\n        34.01965\n      ]\n    ],\n    \"_note\": \"Trimmed to 6 of 4451 points for this example.\"\n  },\n  \"map_url\": \"http://127.0.0.1:8000/api/trips/map/?start=New+York%2C+NY&finish=Los+Angeles%2C+CA\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Dallas, TX -> Houston, TX (under 500 miles)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test(\"under 500 miles\", () => pm.expect(body.distance_miles).to.be.below(500));",
+                  "pm.test(\"one stop is enough\", () => pm.expect(body.fuel_stops.length).to.eql(1));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=Dallas, TX&finish=Houston, TX",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Dallas, TX",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "Houston, TX",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "\nA short trip, well inside one tank. Expect a single stop at the start that buys all the\nfuel for the trip.\n"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=Dallas, TX&finish=Houston, TX",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "Dallas, TX",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Houston, TX",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"start\": {\n    \"lat\": 32.79333,\n    \"lon\": -96.76651\n  },\n  \"finish\": {\n    \"lat\": 29.78574,\n    \"lon\": -95.38881\n  },\n  \"distance_miles\": 238.3,\n  \"duration_hours\": 4.3,\n  \"total_gallons\": 23.83,\n  \"total_cost\": 68.24,\n  \"fuel_stops\": [\n    {\n      \"station\": {\n        \"id\": 72773,\n        \"name\": \"RaceTrac #2626\",\n        \"address\": \"I-20 Exit 472\",\n        \"city\": \"Dallas\",\n        \"state\": \"TX\",\n        \"price\": 2.864,\n        \"location\": {\n          \"lat\": 32.79333,\n          \"lon\": -96.76651\n        }\n      },\n      \"mile\": 0.0,\n      \"gallons\": 23.83,\n      \"cost\": 68.24\n    }\n  ],\n  \"route\": {\n    \"type\": \"LineString\",\n    \"coordinates\": [\n      [\n        -96.76642,\n        32.79325\n      ],\n      [\n        -96.7678,\n        32.78599\n      ],\n      [\n        -96.7739,\n        32.78065\n      ],\n      [\n        -95.37642,\n        29.78676\n      ],\n      [\n        -95.38575,\n        29.78666\n      ],\n      [\n        -95.38881,\n        29.78576\n      ]\n    ],\n    \"_note\": \"Trimmed to 6 of 385 points for this example.\"\n  },\n  \"map_url\": \"http://127.0.0.1:8000/api/trips/map/?start=Dallas%2C+TX&finish=Houston%2C+TX\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Coordinates: Chicago -> Denver as lat,lon",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"echoes the coordinates it was given\", () => {",
+                  "    const b = pm.response.json();",
+                  "    pm.expect(b.start).to.eql({lat: 41.88, lon: -87.63});",
+                  "    pm.expect(b.finish).to.eql({lat: 39.74, lon: -104.99});",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=41.88,-87.63&finish=39.74,-104.99",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "41.88,-87.63",
+                  "description": "lat,lon"
+                },
+                {
+                  "key": "finish",
+                  "value": "39.74,-104.99",
+                  "description": "lat,lon"
+                }
+              ]
+            },
+            "description": "\nLocations can be `lat,lon` instead of `City, ST`. Useful for addresses or places the\nCensus gazetteer doesn't list.\n"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=41.88,-87.63&finish=39.74,-104.99",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "41.88,-87.63",
+                      "description": "lat,lon"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "39.74,-104.99",
+                      "description": "lat,lon"
+                    }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"start\": {\n    \"lat\": 41.88,\n    \"lon\": -87.63\n  },\n  \"finish\": {\n    \"lat\": 39.74,\n    \"lon\": -104.99\n  },\n  \"distance_miles\": 1004.1,\n  \"duration_hours\": 17.8,\n  \"total_gallons\": 100.41,\n  \"total_cost\": 293.35,\n  \"fuel_stops\": [\n    {\n      \"station\": {\n        \"id\": 73127,\n        \"name\": \"Gas N Wash\",\n        \"address\": \"I-55, EXIT 285\",\n        \"city\": \"Chicago\",\n        \"state\": \"IL\",\n        \"price\": 3.399,\n        \"location\": {\n          \"lat\": 41.83705,\n          \"lon\": -87.68494\n        }\n      },\n      \"mile\": 3.0,\n      \"gallons\": 1.45,\n      \"cost\": 4.92\n    },\n    {\n      \"station\": {\n        \"id\": 70180,\n        \"name\": \"Gulf\",\n        \"address\": \"SR-83\",\n        \"city\": \"Bensenville\",\n        \"state\": \"IL\",\n        \"price\": 3.059,\n        \"location\": {\n          \"lat\": 41.95801,\n          \"lon\": -87.94383\n        }\n      },\n      \"mile\": 14.5,\n      \"gallons\": 18.77,\n      \"cost\": 57.43\n    },\n    {\n      \"station\": {\n        \"id\": 67395,\n        \"name\": \"KUM & GO #0267\",\n        \"address\": \"I-80, EXIT 267 & SR 38\",\n        \"city\": \"Tipton\",\n        \"state\": \"IA\",\n        \"price\": 2.982,\n        \"location\": {\n          \"lat\": 41.77012,\n          \"lon\": -91.12828\n        }\n      },\n      \"mile\": 202.2,\n      \"gallons\": 35.7,\n      \"cost\": 106.46\n    },\n    {\n      \"station\": {\n        \"id\": 68368,\n        \"name\": \"AKAL TRAVEL CENTER\",\n        \"address\": \"I-80 EX 360\",\n        \"city\": \"Waco\",\n        \"state\": \"NE\",\n        \"price\": 2.799,\n        \"location\": {\n          \"lat\": 40.897,\n          \"lon\": -97.46175\n        }\n      },\n      \"mile\": 559.2,\n      \"gallons\": 44.5,\n      \"cost\": 124.54\n    }\n  ],\n  \"route\": {\n    \"type\": \"LineString\",\n    \"coordinates\": [\n      [\n        -87.63,\n        41.88007\n      ],\n      [\n        -87.63806,\n        41.87568\n      ],\n      [\n        -87.64778,\n        41.87575\n      ],\n      [\n        -104.98853,\n        39.75354\n      ],\n      [\n        -104.98739,\n        39.74627\n      ],\n      [\n        -104.99,\n        39.74\n      ]\n    ],\n    \"_note\": \"Trimmed to 6 of 1551 points for this example.\"\n  },\n  \"map_url\": \"http://127.0.0.1:8000/api/trips/map/?start=41.88%2C-87.63&finish=39.74%2C-104.99\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Mixed: Atlanta, GA -> Miami coordinates",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=Atlanta, GA&finish=25.77,-80.19",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Atlanta, GA",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "25.77,-80.19",
+                  "description": "lat,lon"
+                }
+              ]
+            },
+            "description": "\nA city on one end and coordinates on the other.\n"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=Atlanta, GA&finish=25.77,-80.19",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "Atlanta, GA",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "25.77,-80.19",
+                      "description": "lat,lon"
+                    }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"start\": {\n    \"lat\": 33.76291,\n    \"lon\": -84.42267\n  },\n  \"finish\": {\n    \"lat\": 25.77,\n    \"lon\": -80.19\n  },\n  \"distance_miles\": 663.8,\n  \"duration_hours\": 12.1,\n  \"total_gallons\": 66.38,\n  \"total_cost\": 197.14,\n  \"fuel_stops\": [\n    {\n      \"station\": {\n        \"id\": 64683,\n        \"name\": \"QUIKTRIP #777\",\n        \"address\": \"I-20, EXIT 49\",\n        \"city\": \"Atlanta\",\n        \"state\": \"GA\",\n        \"price\": 2.972,\n        \"location\": {\n          \"lat\": 33.76291,\n          \"lon\": -84.42267\n        }\n      },\n      \"mile\": 0.0,\n      \"gallons\": 20.55,\n      \"cost\": 61.09\n    },\n    {\n      \"station\": {\n        \"id\": 70429,\n        \"name\": \"BP\",\n        \"address\": \"SR-76\",\n        \"city\": \"Adel\",\n        \"state\": \"GA\",\n        \"price\": 2.969,\n        \"location\": {\n          \"lat\": 31.1248,\n          \"lon\": -83.42548\n        }\n      },\n      \"mile\": 205.5,\n      \"gallons\": 45.83,\n      \"cost\": 136.06\n    }\n  ],\n  \"route\": {\n    \"type\": \"LineString\",\n    \"coordinates\": [\n      [\n        -84.42212,\n        33.76291\n      ],\n      [\n        -84.41752,\n        33.75668\n      ],\n      [\n        -84.41753,\n        33.74925\n      ],\n      [\n        -80.19988,\n        25.77585\n      ],\n      [\n        -80.19313,\n        25.77166\n      ],\n      [\n        -80.18998,\n        25.77\n      ]\n    ],\n    \"_note\": \"Trimmed to 6 of 931 points for this example.\"\n  },\n  \"map_url\": \"http://127.0.0.1:8000/api/trips/map/?start=Atlanta%2C+GA&finish=25.77%2C-80.19\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Map",
+      "description": "\n`GET /api/trips/map/` renders the same trip on a Leaflet map (HTML). It reuses the cached\nplan, so it costs no extra routing call. **Open these in a browser** (or use Postman's\n*Preview* tab) to see the route and the numbered stops.\n",
+      "item": [
+        {
+          "name": "Map: New York, NY -> Los Angeles, CA",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"returns HTML\", () => pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"text/html\"));",
+                  "pm.test(\"embeds the trip data for the map\", () => pm.expect(pm.response.text()).to.include(\"trip-data\"));",
+                  "pm.test(\"cached map responds in under 300 ms\", () => pm.expect(pm.response.responseTime).to.be.below(300));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/map/?start=New York, NY&finish=Los Angeles, CA",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                "map",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "New York, NY",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "Los Angeles, CA",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "\nHTML page with the route, numbered fuel stops and totals. Run the cross-country request\nfirst and this is served from cache.\n"
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/map/?start=New York, NY&finish=Los Angeles, CA",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    "map",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "New York, NY",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Los Angeles, CA",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "html",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "text/html; charset=utf-8"
+                }
+              ],
+              "body": "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <title>Fuel Route</title>\n  <link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\">\n  <style>\n    html, body, #map { height: 100%; margin: 0; font-family: system-ui, sans-serif; }\n    .summary { position: absolute; top: 12px; right: 12px; z-index: 1000; background: #fff; padding: 12px 16px;\n               border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.2); font-size: 14px; line-height: 1.5; }\n    .stop-label { background: none; border: none; box-shadow: none; color: #fff; font-weight: 700; }\n  </style>\n</head>\n<body>\n  <div id=\"map\"></div>\n  <div class=\"summary\" id=\"summary\"></div>\n  <script id=\"trip-data\" type=\"application/json\">{\"start\": {\"lat\": 40.66271, \"lon\": -73.93868}, \"finish\": {\"lat\": 34.01939, \"lon\": -118.41083}, \"distance_miles\": 2810.4, \"duration_hours\": 50.3, \"total_gallons\": 281.04, \"total_cost\": 864.91, \"fuel_stops\": [{\"station\": {\"id\": 62790, \"name\": \"7-ELEVEN #40084\", \"address\": \"US-46/US-1/US-9\", \"city\": \"Palisades Park\", \"state\": \"NJ\", \"price\": 3.099, \"location\": {\"lat\": 40.84702, \"lon\": -73.99706}}, \"mile\": 9.0, \"gallons\": 39.39, \"cost\": 122.06}, {\"station\": {\"id\": 72445, \"name\": \"SHEETZ #639\", \"address\": \"I-80 Exit 223\", \"city\": \"Youngstown\", \"state\": \"OH\", \"price\": 3.059, \"location\": {\"lat\": 41.09909, \"lon\": -80.6459}}, \"mile\": 393.9, \"gallons\": 46.21, \"cost\": 141.34}, {\"station\": {\"id\": 70744, \"name\": \"CASEYS #3686\", \"address\": \"I-80 EXIT 81\", \"city\": \"Utica\", \"state\": \"IL\", \"price\": 2.969, \"location\": {\"lat\": 41.3456, \"lon\": -88.98634}}, \"mile\": 855.9, \"gallons\": 48.51, \"cost\": 144.03}, {\"station\": {\"id\": 68368, \"name\": \"AKAL TRAVEL CENTER\", \"address\": \"I-80 EX 360\", \"city\": \"Waco\", \"state\": \"NE\", \"price\": 2.799, \"location\": {\"lat\": 40.897, \"lon\": -97.46175}}, \"mile\": 1341.0, \"gallons\": 40.97, \"cost\": 114.68}, {\"station\": {\"id\": 73101, \"name\": \"7-ELEVEN 42279\", \"address\": \"I-76, Exit 39\", \"city\": \"Keenesburg\", \"state\": \"CO\", \"price\": 3.149, \"location\": {\"lat\": 40.15517, \"lon\": -104.56342}}, \"mile\": 1750.8, \"gallons\": 37.47, \"cost\": 117.99}, {\"station\": {\"id\": 71712, \"name\": \"MAVERIK COUNTRY STORE #693\", \"address\": \"I-70, Exit 160 \\u0026 hwy 191\", \"city\": \"Green River\", \"state\": \"UT\", \"price\": 3.282, \"location\": {\"lat\": 38.99346, \"lon\": -110.17342}}, \"mile\": 2125.5, \"gallons\": 39.56, \"cost\": 129.85}, {\"station\": {\"id\": 72965, \"name\": \"Maverik #674\", \"address\": \"I-15, Exit 45\", \"city\": \"North Las Vegas\", \"state\": \"NV\", \"price\": 3.282, \"location\": {\"lat\": 36.28986, \"lon\": -115.08918}}, \"mile\": 2521.0, \"gallons\": 28.93, \"cost\": 94.96}], \"route\": {\"type\": \"LineString\", \"coordinates\": [[-73.93872, 40.6631], [-73.94829, 40.66407], [-73.95784, 40.66348], [-73.968, 40.67109], [-73.9726, 40.67751], [-73.97737, 40.68402], [-73.98203, 40.69123], [-73.98547, 40.69806], [-73.98941, 40.70509], [-73.99459, 40.71437], [-74.00181, 40.71934], [-74.00715, 40.72542], [-74.01704, 40.7269], [-74.02645, 40.72846], [-74.03574, 40.73017], [-74.04504, 40.73203], [-74.05974, 40.7379], [-74.07058, 40.73956], [-74.08021, 40.74048], [-74.08907, 40.74394], [-74.09783, 40.74705], [-74.10759, 40.74719], [-74.12009, 40.74962], [-74.12948, 40.7479], [-74.14405, 40.74318], [-74.15368, 40.74238], [-74.16141, 40.74671], [-74.17088, 40.74775], [-74.18017, 40.7498], [-74.18924, 40.75232], [-74.19844, 40.75513], [-74.20699, 40.75876], [-74.21782, 40.76438], [-74.22666, 40.76772], [-74.23569, 40.77085], [-74.24188, 40.77887], [-74.24777, 40.78555], [-74.24861, 40.79357], [-74.25641, 40.79781], [-74.26627, 40.79794], [-74.27551, 40.80032], [-74.28412, 40.80483], [-74.29158, 40.80975], [-74.30208, 40.81085], [-74.31162, 40.81471], [-74.31672, 40.82091], [-74.32361, 40.82699], [-74.33106, 40.83164], [-74.33707, 40.83761], [-74.34347, 40.84325], [-74.35167, 40.84728], [-74.35662, 40.85353], [-74.36386, 40.85839], [-74.37362, 40.85911], [-74.38308, 40.86038], [-74.39301, 40.86058], [-7\n<!-- trimmed for the example -->"
+            }
+          ]
+        },
+        {
+          "name": "Map: last trip planned (from map_url)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Point this request at the map_url saved by the last successful trip request.",
+                  "const url = pm.collectionVariables.get(\"lastMapUrl\");",
+                  "if (url) pm.request.url = url;",
+                  "else console.warn(\"Run a request from '1. Plan a trip' first, so there is a map_url to open.\");"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"returns HTML\", () => pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"text/html\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{lastMapUrl}}",
+            "description": "Opens the `map_url` from the most recent successful trip request (saved to the `lastMapUrl` collection variable by the collection tests)."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "3. Errors",
+      "description": "\nBad input. Status codes:\n\n| Status | When |\n| --- | --- |\n| 400 | Missing parameter, unknown city, wrong format, or a point outside the contiguous USA |\n| 405 | Anything but GET |\n| 422 | No drivable route, or a stretch longer than 500 miles with no fuel station |\n| 502 | The routing service (OSRM) is down |\n\n502 isn't in this folder: it needs OSRM to be down. The automated tests cover it with a\nmocked router (`python manage.py test`).\n",
+      "item": [
+        {
+          "name": "Missing finish",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"names the missing field\", () => pm.expect(pm.response.json()).to.have.property(\"finish\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=Chicago, IL",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Chicago, IL",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "`finish` is required."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=Chicago, IL",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "Chicago, IL",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"finish\": [\n    \"This field is required.\"\n  ]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Missing both parameters",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"names both missing fields\", () => pm.expect(pm.response.json()).to.include.all.keys(\"start\", \"finish\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": []
+            },
+            "description": "Both `start` and `finish` are required."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": []
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"start\": [\n    \"This field is required.\"\n  ],\n  \"finish\": [\n    \"This field is required.\"\n  ]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Unknown city",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"detail says: Unknown US city\", () => pm.expect(String(pm.response.json().detail)).to.include(\"Unknown US city\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=Atlantis, KS&finish=Denver, CO",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Atlantis, KS",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "Denver, CO",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "A `City, ST` that isn't in the Census gazetteer."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=Atlantis, KS&finish=Denver, CO",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "Atlantis, KS",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Denver, CO",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"Unknown US city: 'Atlantis, KS'.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "City without a state",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"detail says: City, ST\", () => pm.expect(String(pm.response.json().detail)).to.include(\"City, ST\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=Chicago&finish=Denver, CO",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Chicago",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "Denver, CO",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "The state code is required: `Chicago, IL`, not `Chicago`."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=Chicago&finish=Denver, CO",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "Chicago",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Denver, CO",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"Use 'City, ST' or 'lat,lon', got 'Chicago'.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Full state name",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=Austin, Texas&finish=Denver, CO",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Austin, Texas",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "Denver, CO",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "Use the two-letter code (`Austin, TX`), not `Austin, Texas`."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=Austin, Texas&finish=Denver, CO",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "Austin, Texas",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Denver, CO",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"Use 'City, ST' or 'lat,lon', got 'Austin, Texas'.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Outside the USA (London)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"detail says: outside the contiguous USA\", () => pm.expect(String(pm.response.json().detail)).to.include(\"outside the contiguous USA\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=51.5,-0.12&finish=Denver, CO",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "51.5,-0.12",
+                  "description": "lat,lon"
+                },
+                {
+                  "key": "finish",
+                  "value": "Denver, CO",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "Coordinates outside the contiguous USA are rejected before any routing call."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=51.5,-0.12&finish=Denver, CO",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "51.5,-0.12",
+                      "description": "lat,lon"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Denver, CO",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"'51.5,-0.12' is outside the contiguous USA.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Alaska (outside the contiguous USA)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"detail says: outside the contiguous USA\", () => pm.expect(String(pm.response.json().detail)).to.include(\"outside the contiguous USA\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=61.22,-149.90&finish=Seattle, WA",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "61.22,-149.90",
+                  "description": "lat,lon"
+                },
+                {
+                  "key": "finish",
+                  "value": "Seattle, WA",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "Alaska and Hawaii are out of scope: the fuel data covers the contiguous USA only."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=61.22,-149.90&finish=Seattle, WA",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "61.22,-149.90",
+                      "description": "lat,lon"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Seattle, WA",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"'61.22,-149.90' is outside the contiguous USA.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "No fuel within range: Seattle, WA -> San Francisco, CA (422)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"detail says: exceeds the 500-mile range\", () => pm.expect(String(pm.response.json().detail)).to.include(\"exceeds the 500-mile range\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=Seattle, WA&finish=San Francisco, CA",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Seattle, WA",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "San Francisco, CA",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "\nA real 422. The supplied price list has few stations in Oregon and California (29 and 16),\nand none within 10 miles of I-5 for more than 500 miles, so no plan can stay within range.\n"
+          },
+          "response": [
+            {
+              "name": "422 Unprocessable Entity",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=Seattle, WA&finish=San Francisco, CA",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "Seattle, WA",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "San Francisco, CA",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "Unprocessable Entity",
+              "code": 422,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"No fuel station between mile 261 and mile 835; that exceeds the 500-mile range.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Map with an unknown city",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"mentions the bad city\", () => pm.expect(pm.response.text()).to.include(\"Unknown US city\"));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/map/?start=Atlantis, KS&finish=Denver, CO",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                "map",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Atlantis, KS",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "Denver, CO",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "The map view returns the error as plain text with the same status code."
+          },
+          "response": [
+            {
+              "name": "400 Bad Request",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/map/?start=Atlantis, KS&finish=Denver, CO",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    "map",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "Atlantis, KS",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Denver, CO",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "text",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "text/plain"
+                }
+              ],
+              "body": "{'detail': ErrorDetail(string=\"Unknown US city: 'Atlantis, KS'.\", code='invalid')}"
+            }
+          ]
+        },
+        {
+          "name": "POST is not allowed",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 405\", () => pm.response.to.have.status(405));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/trips/?start=Chicago, IL&finish=Denver, CO",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "trips",
+                ""
+              ],
+              "query": [
+                {
+                  "key": "start",
+                  "value": "Chicago, IL",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                },
+                {
+                  "key": "finish",
+                  "value": "Denver, CO",
+                  "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                }
+              ]
+            },
+            "description": "The trip endpoint is read-only."
+          },
+          "response": [
+            {
+              "name": "405 Method Not Allowed",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/api/trips/?start=Chicago, IL&finish=Denver, CO",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "trips",
+                    ""
+                  ],
+                  "query": [
+                    {
+                      "key": "start",
+                      "value": "Chicago, IL",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    },
+                    {
+                      "key": "finish",
+                      "value": "Denver, CO",
+                      "description": "'City, ST' (two-letter state) or 'lat,lon'"
+                    }
+                  ]
+                }
+              },
+              "status": "Method Not Allowed",
+              "code": 405,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"Method \\\"POST\\\" not allowed.\"\n}"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

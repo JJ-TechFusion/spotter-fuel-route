@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fuel Route</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
+    .summary { position: absolute; top: 12px; right: 12px; z-index: 1000; background: #fff; padding: 12px 16px;
+               border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,.2); font-size: 14px; line-height: 1.5; }
+    .stop-label { background: none; border: none; box-shadow: none; color: #fff; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="summary" id="summary"></div>
+  {{ trip|json_script:"trip-data" }}
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const trip = JSON.parse(document.getElementById("trip-data").textContent);
+    const map = L.map("map");
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "&copy; OpenStreetMap contributors",
+    }).addTo(map);
+
+    const line = L.geoJSON(trip.route, { style: { color: "#2563eb", weight: 5 } }).addTo(map);
+    map.fitBounds(line.getBounds(), { padding: [30, 30] });
+
+    L.marker([trip.start.lat, trip.start.lon]).addTo(map).bindPopup("Start");
+    L.marker([trip.finish.lat, trip.finish.lon]).addTo(map).bindPopup("Finish");
+
+    trip.fuel_stops.forEach((stop, i) => {
+      const s = stop.station;
+      L.circleMarker([s.location.lat, s.location.lon], { radius: 9, color: "#b91c1c", fillOpacity: 0.9 })
+        .addTo(map)
+        .bindTooltip(String(i + 1), { permanent: true, direction: "center", className: "stop-label" })
+        .bindPopup(`<b>${i + 1}. ${s.name}</b><br>${s.address}, ${s.city}, ${s.state}<br>
+                    Mile ${stop.mile} &middot; $${s.price}/gal<br>${stop.gallons} gal = $${stop.cost}`);
+    });
+
+    document.getElementById("summary").innerHTML =
+      `<b>${trip.distance_miles} mi</b> &middot; ${trip.duration_hours} h<br>
+       ${trip.fuel_stops.length} fuel stops &middot; ${trip.total_gallons} gal<br>
+       <b>Total fuel: $${trip.total_cost}</b>`;
+  </script>
+</body>
+</html>
